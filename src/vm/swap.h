@@ -1,4 +1,3 @@
-
 #include "devices/block.h"
 #include "lib/kernel/bitmap.h"
 

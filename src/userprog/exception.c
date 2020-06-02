@@ -121,6 +121,13 @@ kill (struct intr_frame *f)
    can find more information about both of these in the
    description of "Interrupt 14--Page Fault Exception (#PF)" in
    [IA32-v3a] section 5.15 "Exception and Interrupt Reference". */
+
+/*
+   page fault는fault가생긴 address의  vm_entry의 유무를 확인하여 
+   vm_entry가 존재한다면 handle_mm_fault()를 통하여 load합니다. 만약 stack영역이라면
+   stack expansion을 진행합니다.
+   해당 주소가 잘못 주소이거나 vm_entry가 없거나 load에 실패했다면 exit(-1)을 호출합니다.
+*/
 static void
 page_fault (struct intr_frame *f) 
 {
@@ -159,51 +166,40 @@ page_fault (struct intr_frame *f)
           user ? "user" : "kernel");
   kill (f);
   */
-    
+  
+  /*
+   먼저 not_present flag를 확인합니다. 해당 flag가 0이라면 read only page에 
+   writting을 했다는 것이기 때문에 exit(-1)을 호출합니다.
+
+   이후 1) VM_ENTRY가 있는 경우에는
+   handle_mm_fault를 이용하여 vm_entry의 정보를 토대로 page를 할당합니다. 실패 시 
+   exit(-1)을 호출합니다.
+
+   2) VM_ENTRY가 없는 경우에는 
+   stack 영역이라면 expand_stack을 진행합니다. 만약 아니거나 expand_stack을 실패했을시
+   exit(-1)을 호출합니다.          
+  */
   if(not_present)
   {  
     struct vm_entry * ve1 =  find_vme(fault_addr);  
-     
      if(ve1) 
-     { 
-        if(handle_mm_fault(ve1))
-        ve1->is_loaded = true;
-        else
-        {
+     {   
+        if(!handle_mm_fault(ve1))
          exit(-1);                   
-        }
      } 
-     
      else
-      {
-       if((fault_addr<=0xc0000000)&&(fault_addr>0xbf800000)&&(uint32_t)f->esp-(uint32_t)fault_addr<=(32) )
-        {  
-           if(expand_stack(fault_addr))
-           { ve1 = find_vme(fault_addr);
-             if(handle_mm_fault(ve1))
-             ve1->is_loaded = true;
-             else
-             exit(-1);
-           }
-           else
-           {
-              exit(-1);
-           }
+      { 
+       if((fault_addr<=0xc0000000)&&(fault_addr>0xbf800000)&&((void*)((uintptr_t)f->esp-32)<=fault_addr))
+        { 
+           if(!expand_stack(fault_addr))
+            exit(-1);
         }
         else
-        {
-          
-          printf("hererererer!!!\n");
-          printf("\npage fault : %p\n",fault_addr);
           exit(-1);
-        }
       }  
    }
-
    else
- {  
     exit(-1);
- }
+
 }
  
-

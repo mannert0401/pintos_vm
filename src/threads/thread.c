@@ -186,9 +186,11 @@ thread_create (const char *name, int priority,
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
   
-
+  /* Setting next_fd by 2. Because fd 1 is stdout, and fd 0 is stdin. */
   t->next_fd = 2;
 
+  /* Indicate current thread's parent thread and push the list elem to the
+     parent's child list. */
   t->parent = thread_current();
   list_push_back(&thread_current()->child,&t->child_elem);
 
@@ -292,6 +294,11 @@ thread_tid (void)
   return thread_current ()->tid;
 }
 
+
+/*
+   find child thread at thread current's child list and return child thread's
+   tid. It child thread is not exist, then return Null pointer.
+*/
 struct thread * get_child_process (tid_t tid)
 {
 
@@ -306,6 +313,11 @@ struct thread * get_child_process (tid_t tid)
  }
   return NULL;
 }
+
+/*
+   remove current thread's list elem from parent's child_list.
+   If thread is not initial_thread, then free page containing struc thread.    
+*/
 void remove_child_process(struct thread *cp)
 {
   list_remove(&cp->child_elem);
@@ -505,7 +517,6 @@ init_thread (struct thread *t, const char *name, int priority)
   
   sema_init(&t->sema_exit,0);
   sema_init(&t->sema_load,0);
-  sema_init(&t->sema_dest,0);
   list_init(&t->child);
   list_init(&t->mmap_list);
 }

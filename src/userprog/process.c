@@ -68,6 +68,7 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 { 
+  /*Using strtok_r, we can know file_name_'s word count.*/
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
@@ -77,12 +78,13 @@ start_process (void *file_name_)
   char * token;
   token = strtok_r(f2," ",&next_ptr);
   int count=0;
-
+  /*caculate word count of file_name_ */
   while(token!=NULL)
   { 
     token = strtok_r(NULL," ",&next_ptr);
     count++;
   }
+  /*From bottom code, we parse file_name_ and save the words at parse. */
   strlcpy(f2,file_name,strlen(file_name)+1);
   char **parse =(char**)malloc(sizeof(char*)*count);
   int i;
@@ -94,19 +96,20 @@ start_process (void *file_name_)
   }
   
   
-  vm_init(&thread_current()->vm);
+  vm_hash_init(&thread_current()->vm_hash);
   
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS; 
+
+  /* Load using parsed function name and parent's flag make success. */
   success = load(parse[0], &if_.eip, &if_.esp);
   thread_current()->parent->pr_success=success;
   sema_up(&thread_current()->parent->sema_load);
-  /* If load failed, quit. */
  
-  
+  /* If load failed, quit. */ 
   if (!success)
    {    
     free(parse);
@@ -131,11 +134,14 @@ start_process (void *file_name_)
   
 }
 
+/* This function is putting the process' data on the stack */
 void argument_stack(char **parse, int count, void **esp)
 {
   int i;
   int len;
   int t_len=0;
+ 
+  /* put the parsing arguments to the stack */
   for(i=count-1; i>-1; i--)
   { len = strlen(parse[i])+1;
      *esp -= len;
@@ -144,30 +150,39 @@ void argument_stack(char **parse, int count, void **esp)
     parse[i] = *esp;
     
   }
-
+  /*For word-align of the stack */ 
    *esp -=(4-(t_len%4))%4; 
-  
-
+ 
+  /*For Null space argv */
    *esp -= 4;
    **(uint32_t**)esp = 0;
 
+  /*For argument's address push to the stack */
   for(i=count-1; i>-1; i--)
   {
     *esp -= 4;
     **(uint32_t**)esp = parse[i];
   }
 
+  /* argv**'s address push to the stack */
   *esp -= 4;
   **(uint32_t**)esp = *esp + 4;
 
+  /* argc's value push to the stack */
   *esp -= 4;
   **(uint32_t**)esp = count;
 
+  /*fake address push to the stack */
   *esp -= 4;
   **(uint32_t**)esp = 0;
 
 }
 
+/* 
+   put file into the current thread's file descriptor.
+   It pushed at (next_fd)th file descriptor array.
+   Then we must increase next_fd and return next_fd-1.
+*/
 int process_add_file (struct file *f)
 { 
   if(f==NULL)
@@ -178,6 +193,11 @@ int process_add_file (struct file *f)
   return(t1->next_fd-1);
 }
 
+
+/*
+   It returns current thread's (fd)th file saved at file descriptor.
+   If fd is not invalid, then we return NULL pointer.
+*/
 struct file * process_get_file(int fd)
 { 
   struct thread * t1=thread_current();
@@ -185,6 +205,11 @@ struct file * process_get_file(int fd)
   return NULL;
   return (t1->fdt[fd]);
 }
+
+/*
+   This function close current thread's (fd)th file saved at file descriptor.
+   If fd is not invalid, then we just finish and doing nothing.
+*/
 
 void process_close_file(int fd)
 {
@@ -207,18 +232,29 @@ void process_close_file(int fd)
 int
 process_wait (tid_t child_tid) 
 { 
+ /*
+   we can obtain child_tid using get_child_process. 
+ */
  int status1;
  struct thread * t1 = get_child_process(child_tid);
  if(t1==NULL)
 {
  return -1;
 }
+ /*
+   We wait until child process sema up this semaphore. 
+   It may be child process' termination.
+ */
  sema_down(&t1->sema_exit);
- status1 = t1->exit_status;
- 
+ /*
+  Save child process' exit status at status1.
+  And close running file of terminated child process.
+  Now we free child process' page containing struct thread.
+  return exit status.
+ */
+ status1 = t1->exit_status; 
  file_close(t1->run_file);
  remove_child_process(t1);
- 
  return status1; 
 }
 
@@ -230,11 +266,16 @@ process_exit (void)
   uint32_t *pd;
   int cur_fd=cur->next_fd-1;
   int i;
-   
 
+   /*
+     Close all file opend by this thread.
+   */ 
    for(i=cur_fd; i>1; i--)
    process_close_file(i); 
-  
+ 
+  /*
+    현 thread(process)에 mapping되어 있는 모든 memory mapping file을 unmap시킵니다.
+  */ 
   while(!list_empty(&cur->mmap_list))
   {  
      struct mmap_file * mf1 = list_entry(list_pop_front(&cur->mmap_list),struct mmap_file,elem);
@@ -242,8 +283,14 @@ process_exit (void)
 
   }  
  
-  vm_destroy (&cur->vm);
-  
+  /*
+    hash table에 저장되어있는 vm_entry들을 모두 삭제시킵니다.
+  */
+
+  lock_acquire(&alloc_lock);
+  vm_hash_destroy (&cur->vm_hash);
+  lock_release(&alloc_lock);
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */  
   pd = cur->pagedir;
@@ -367,7 +414,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
-  /* Open executable file. */
+  /* 
+    Open executable file.
+    filesys_lock을 이용하여 실행할 file의 쓰기금지를 보장합니다. 
+  */
   lock_acquire(&filesys_lock);  
   file = filesys_open (file_name);
   if (file == NULL) 
@@ -379,6 +429,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   t->run_file = file;
   file_deny_write(file); 
   lock_release(&filesys_lock);
+
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -516,7 +567,8 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
-/* Loads a segment starting at offset OFS in FILE at address
+/* 
+   Make VM_entry starting at offset OFS in FILE at address
    UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
    memory are initialized, as follows:
 
@@ -529,7 +581,11 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
    user process if WRITABLE is true, read-only otherwise.
 
    Return true if successful, false if a memory allocation error
-   or disk read error occurs. */
+   or disk read error occurs. 
+   기존의 load_segment는시작할 때 page를 할당받고 file을바로 load
+   했지만 지금의 load_segment는 vm_entry만 생성하고 나중에 page의
+   가상 주소가 실제로 호출되면 page_fault를 통하여 load됩니다.
+*/
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
@@ -538,6 +594,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
+ 
   file_seek (file, ofs);
   while (read_bytes > 0 || zero_bytes > 0) 
     {
@@ -569,6 +626,11 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           return false; 
         }
 */
+
+      /*
+        while문을 통하여 원래 생성했어야 할 Page 당 1개의 VM_entry를
+        생성한 뒤 이후 load 시에 필요한 정보를 입력합니다.
+      */
       struct vm_entry * ve1 = malloc(sizeof(struct vm_entry));
       ve1->type = VM_BIN;
       ve1->vaddr = (void *)upage;
@@ -578,8 +640,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       ve1->offset = ofs;
       ve1->read_bytes = page_read_bytes; 
       ve1->zero_bytes = page_zero_bytes;
-      insert_vme (&thread_current()->vm,ve1);     
-
+      ve1->swap_slot = 9999; 
+      insert_vme (&thread_current()->vm_hash,ve1);     
+      
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
@@ -589,34 +652,61 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   return true;
 }
 
-/* Create a minimal stack by mapping a zeroed page at the top of
-   user virtual memory. */
+/* 
+   Create a minimal stack by mapping a zeroed page at the top of
+   user virtual memory. 
+   그 후 stack의 vm_entry를 만들고 lru에 추가합니다.
+*/
 static bool
 setup_stack (void **esp) 
 { 
   bool success = false;
+  
+  //page 할당을 위하여 lock을 획득합니다.
+  lock_acquire(&alloc_lock);
+
+  //alloc_page를 통하여 user영역에 0으로 초기화된 page를 획득합니다.
   struct page * kpage = alloc_page(PAL_USER | PAL_ZERO);
-   
+  
   if (kpage != NULL) 
     {
    
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage->kaddr, true);
-      
+       
       if (success)
         *esp = PHYS_BASE;
       else
-        free_page(kpage->kaddr);
-    }
- 
+        {
+         free_page(kpage->kaddr);
+         lock_release(&alloc_lock);
+         return false;
+        }
+     }
+
+  else
+    return false; 
+  /*
+    처음 setup시할당되는 1개의 page에 대하여 vm_entry를 생성하고 정보를 입력합니다.
+  */
   struct vm_entry * ve1 = malloc(sizeof(struct vm_entry));
 
   ve1->type = VM_ANON;
   ve1->vaddr = (uint8_t *) PHYS_BASE - PGSIZE;
   ve1->writable = true;
   ve1->is_loaded = true;
+  ve1->swap_slot = 9999;  
+  ve1->read_bytes = 0;
+  ve1->zero_bytes = PGSIZE; 
+  insert_vme(&thread_current()->vm_hash,ve1);
+   
+  /*
+    page를 할당 했으니 page의 vm_entry를 선언하고
+    lru list에 삽입하여 victim이 될수 있게 만듭니다.
+  */
   kpage->vme = ve1;
-    
-  insert_vme(&thread_current()->vm,ve1);
+  add_page_to_lru_list(kpage);
+
+  lock_release(&alloc_lock);
   return success;
 }
 
@@ -632,7 +722,7 @@ setup_stack (void **esp)
 static bool
 install_page (void *upage, void *kpage, bool writable)
 {
-  struct thread *t = thread_current ();
+ struct thread *t = thread_current ();
 
   /* Verify that there's not already a page at that virtual
      address, then map our page there. */
@@ -640,114 +730,185 @@ install_page (void *upage, void *kpage, bool writable)
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
 
+/*
+   VM_ENTRY만 존재하고 page는 할당되지 않은 것들을 할당하는 함수입니다.
+   Binary나 memory mapped file인 경우에는 load_file을 통하여 load를 합니다.
+   ANON type은 Stack과 swap slot에 존재할 수 있는데 stack은 항상 vm_entry가 
+   page 할당 후 만들어지기 때문에 swap slot에 있는 것들만 handle_mm_fault가 발생합니다.
+   따라서 swap_in을 통하여 swap영역에 있는 데이터를 가지고 옵니다.  
+*/
+
 bool handle_mm_fault(struct vm_entry *vme)
 {
+  bool success = false;
   
- bool success = false;
- struct page *kpage = alloc_page (PAL_USER); 
- 
- if(kpage == NULL)
-  { 
-    return false;
-  }
- 
+  //page alloc을 위하여 lock을 획득합니다.
+  lock_acquire(&alloc_lock); 
+
+  //page를 할당합니다.
+  struct page *kpage = alloc_page (PAL_USER); 
+
+  ASSERT(kpage !=NULL);
+
+  //page에 대한 정보를 입력하고 lru list에 추가합니다.  
   kpage->vme = vme; 
-   
+  add_page_to_lru_list(kpage);
+  
   switch(vme->type)
   {
+    //VM_BIN은 binary파일로 load_file을 통하여kaddr에 해당하는 frame에 file을 읽어옵니다.
     case VM_BIN:
     success = load_file(kpage->kaddr,vme);
     break;
-
+   
+    /*
+       VM_FILE은 memory mapped file로 위와같이load file을 이용하여 
+       kaddr에 해당하는 frame에 mapping합니다.
+    */
     case VM_FILE:   
     success = load_file(kpage->kaddr,vme);
     break;
     
+    /*
+       VM_ANON은 swap slot에 존재하는 데이터이기 때문에 swap_in을 이용하여
+       kaddr에 해당하는 주소에 frame을 가지고옵니다.
+    */
     case VM_ANON:
     swap_in(vme->swap_slot,kpage->kaddr);
     success = true;
     break;
 
-
     default: 
-    
-    return false;  
-	       	
+    lock_release(&alloc_lock);
+    return false;  	       	
   }
-    
-
-  if(!success)
-  {    
+  
+  //install page를 통하여 vaddr과 kaddr을pagedir에서 연결시킵니다.
+  if(!success||!install_page(vme->vaddr,kpage->kaddr,vme->writable))
+  {
+    free_page(kpage->kaddr);
+    lock_release(&alloc_lock);
     return false;
   }
+
+  if(success)
+    vme->is_loaded = true;
  
-  if(!install_page(vme->vaddr,kpage->kaddr,vme->writable))
-    {       
-      return false;
-    }
- 
+   lock_release(&alloc_lock);
+  
    return success;
 }
 
 
-
+/*
+  memory mapping file을 unmap시에 사용하는 함수입니다. munmap에서 사용하며 mmap_file을 
+  인자로 받아서 할당을 해제합니다.
+*/
 void do_munmap(struct mmap_file * mmap_file)
 {
+  
   struct thread * cur = thread_current();
-  struct mmap_file * mf1 = mmap_file;
   struct vm_entry * ve1;
   struct list_elem * me1;
-  
-   while(!list_empty(&mf1->vme_list))
+
+  //mmap file의 vme_list들을 모두 소멸시킵니다.
+   while(!list_empty(&mmap_file->vme_list))
      {
-       me1 = list_pop_front(&mf1->vme_list);
-     
+       //mmap_file의 헤드를 방출시킵니다.
+       me1 = list_pop_front(&mmap_file->vme_list);
+       
        ve1 = list_entry(me1,struct vm_entry,mmap_elem);
-           
-      if(ve1->is_loaded)
-      {
-        void * kaddr = pagedir_get_page(cur->pagedir,ve1->vaddr);
-        if(pagedir_is_dirty(cur->pagedir,ve1->vaddr))
-        {  
+      
+       lock_acquire(&alloc_lock);
+      
+       //만약 vm_entry가 page할당이 되어있다면 해제합니다.    
+       if(ve1->is_loaded==true)
+       { 
+         //만약 dirty한 상태라면 block에 덮어씌워줍니다.
+          if(pagedir_is_dirty(cur->pagedir,ve1->vaddr))
+         {
            lock_acquire(&filesys_lock);
            file_write_at(ve1->file, ve1->vaddr,ve1->read_bytes,ve1->offset);
            lock_release(&filesys_lock);
-        }
-        free_page(kaddr);        
-      }
-      delete_vme(&thread_current()->vm,ve1);
-     } 
-  
- struct file * f1 = mf1->file;
- free(mf1);
- file_close(f1);
-}
+         }
+        //page를 해제해줍니다.
+        free_page_vme(ve1);  
+        ve1->is_loaded = false;      
+       }
+     
 
+       //file 데이터를 구성하는 vm_entry를 삭제해줍니다. 
+       delete_vme(&cur->vm_hash,ve1);
+
+       lock_release(&alloc_lock);      
+     } 
+ 
+ //파일을 닫고 mmap_file을 삭제해줍니다. 
+ struct file * f1 = mmap_file->file;
+ file_close(f1);
+ free(mmap_file);
+ }
+
+/*
+   스택 확장시에 사용하는 함수입니다. 만약 호출된 addr과 현재 존재하는
+   stack 사이에서  while문을 통하여  그 사이에 있어야 하는 모든 vm_entry를 생성하고 
+   page를 할당해줘야 합니다. 
+*/
 bool expand_stack(void *addr)
 {
+
   bool success = false;
- 
+
+  //page 할당을 위하여 alloc_lock을 할당했습니다. 
+  lock_acquire(&alloc_lock);
+
+  //page 단위로 내림을 하여해당 addr부터 올라가면서 vm_entry를 생성하고 할당할 것입니다. 
   addr = pg_round_down(addr);
 
+  //vm_entry가 존재하는 주소까지 올라갑니다.
+  while(!find_vme(addr))
+{ 
+ 
+  success = false;
+  
+  //page를 할당합니다.
   struct page * kpage = alloc_page(PAL_USER | PAL_ZERO);
-
+ 
+  //vm_entry를 할당합니다.
   struct vm_entry * ve1 = malloc(sizeof(struct vm_entry));
 
+  //vm_entry에정보를 입력합니다.
   ve1->type = VM_ANON;
   ve1->vaddr = addr;
   ve1->writable = true;
   ve1->is_loaded = true;
+  ve1->swap_slot = 9999;
   kpage->vme = ve1;
-
+  insert_vme(&thread_current()->vm_hash,ve1);
+  
+  //page를 pagedir에 등록하고 lru_list에 삽입합니다.
   if (kpage != NULL)
-    {
+    { 
       success = install_page (addr, kpage->kaddr, true);
 
       if (!success)
-        free_page(kpage->kaddr);
-    }
+        { 
+          free_page_vme(ve1);
+          lock_release(&alloc_lock);
+          return false;
+        }
 
-  insert_vme(&thread_current()->vm,ve1);
+      add_page_to_lru_list(kpage);
+    }
+ 
+  //page size만큼주소를 올려가며 반복합니다.  
+  addr = addr+PGSIZE;
+   
+}
+
+lock_release(&alloc_lock);
+
   return success;                                 
+
 }
 
